@@ -576,6 +576,90 @@ def normalize_signature(title: str, artist: str) -> str:
     c_artist = clean(primary_artist)
     return f"{c_title}:::{c_artist}"
 
+class SyncHistoryManager:
+    """Gestiona el registro persistente de canciones sincronizadas y no encontradas."""
+    def __init__(self, playlist_name: str, cache_dir: str = "sync_history", reset_not_found: bool = False):
+        self.cache_dir = cache_dir
+        os.makedirs(self.cache_dir, exist_ok=True)
+        # Generar nombre de archivo limpio a partir de la playlist
+        clean_slug = re.sub(r'[^a-zA-Z0-9_-]', '_', playlist_name.lower().strip())
+        self.state_file = os.path.join(self.cache_dir, f"{clean_slug}_state.json")
+        self.synced_txt_file = os.path.join(self.cache_dir, f"{clean_slug}_synced.txt")
+        self.not_found_txt_file = os.path.join(self.cache_dir, f"{clean_slug}_not_found.txt")
+
+        self.state = self._load_state()
+
+        if reset_not_found:
+            self.state["not_found"] = {}
+            print(f"        [*] Se reinició la lista de canciones no encontradas para '{playlist_name}'.")
+
+    def _load_state(self) -> dict:
+        if os.path.exists(self.state_file):
+            try:
+                with open(self.state_file, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception:
+                pass
+        return {"synced": {}, "not_found": {}}
+
+    def is_synced(self, sp_id: str, signature: str) -> bool:
+        if sp_id and sp_id in self.state["synced"]:
+            return True
+        for item in self.state["synced"].values():
+            if item.get("signature") == signature:
+                return True
+        return False
+
+    def is_not_found(self, sp_id: str, signature: str) -> bool:
+        if sp_id and sp_id in self.state["not_found"]:
+            return True
+        for item in self.state["not_found"].values():
+            if item.get("signature") == signature:
+                return True
+        return False
+
+    def mark_synced(self, sp_id: str, title: str, artist: str, apple_id: str, signature: str = ""):
+        self.state["synced"][sp_id] = {
+            "title": title,
+            "artist": artist,
+            "apple_id": str(apple_id),
+            "signature": signature or normalize_signature(title, artist),
+            "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }
+        if sp_id in self.state["not_found"]:
+            del self.state["not_found"][sp_id]
+
+    def mark_not_found(self, sp_id: str, title: str, artist: str, signature: str = ""):
+        self.state["not_found"][sp_id] = {
+            "title": title,
+            "artist": artist,
+            "signature": signature or normalize_signature(title, artist),
+            "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }
+
+    def save(self):
+        """Guarda el archivo JSON y reescribe los archivos .txt legibles para el usuario."""
+        try:
+            with open(self.state_file, "w", encoding="utf-8") as f:
+                json.dump(self.state, f, indent=2, ensure_ascii=False)
+
+            with open(self.synced_txt_file, "w", encoding="utf-8") as f:
+                f.write(f"# CANCIONES SINCRONIZADAS CON ÉXITO: {len(self.state['synced'])}\n")
+                f.write(f"# Última actualización: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write("# Formato: [Spotify ID] Título - Artista => Apple Music ID\n\n")
+                for sp_id, data in self.state["synced"].items():
+                    f.write(f"[{sp_id}] {data['title']} - {data['artist']} => {data.get('apple_id', '')}\n")
+
+            with open(self.not_found_txt_file, "w", encoding="utf-8") as f:
+                f.write(f"# CANCIONES NO ENCONTRADAS EN APPLE MUSIC: {len(self.state['not_found'])}\n")
+                f.write(f"# Última actualización: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write("# (El script las omite automáticamente en cada ejecución para no perder tiempo)\n")
+                f.write("# Formato: [Spotify ID] Título - Artista\n\n")
+                for sp_id, data in self.state["not_found"].items():
+                    f.write(f"[{sp_id}] {data['title']} - {data['artist']}\n")
+        except Exception as e:
+            print(f"[Aviso] No se pudo guardar historial de sincronización: {e}")
+
 def parse_playlists_config(raw_str: str) -> list:
     """Parsea una lista de cadenas con formato 'SPOTIFY_ID=APPLE_NAME;...'"""
     playlists = []
@@ -593,13 +677,15 @@ def parse_playlists_config(raw_str: str) -> list:
             playlists.append({"spotify_id": entry.strip(), "apple_name": ""})
     return playlists
 
-def sync_playlist(spotify: SpotifyClient, apple: AppleMusicClient, spotify_id: str, apple_name: str) -> dict:
-    """Ejecuta la sincronización incremental de una playlist."""
+def sync_playlist(spotify: SpotifyClient, apple: AppleMusicClient, spotify_id: str, apple_name: str, reset_not_found: bool = False) -> dict:
+    """Ejecuta la sincronización incremental de una playlist con caché persistente de sincronizadas y no encontradas."""
     meta = spotify.get_playlist_metadata(spotify_id)
     playlist_name = apple_name or meta.get("name", "Spotify Sync")
     print(f"\n==================================================================")
     print(f"▶ Sincronizando: '{meta.get('name')}' -> Apple Music: '{playlist_name}'")
     print(f"==================================================================")
+
+    history = SyncHistoryManager(playlist_name, reset_not_found=reset_not_found)
 
     # 1. Obtener canciones de Spotify
     print("  [1/4] Leyendo canciones de Spotify...")
@@ -612,20 +698,30 @@ def sync_playlist(spotify: SpotifyClient, apple: AppleMusicClient, spotify_id: s
     existing_catalog_ids, existing_signatures = apple.get_playlist_existing_tracks(apple_playlist_id)
     print(f"        Canciones actuales en Apple Music: {len(existing_signatures)} (IDs únicos: {len(existing_catalog_ids)})")
 
-    # 3. Emparejar canciones de Spotify que no estén aún en Apple Music
+    # 3. Emparejar canciones de Spotify que no estén aún en Apple Music ni descartadas previamente
     print("  [3/4] Identificando canciones nuevas...")
-    new_track_ids_to_add = []
-    not_found_tracks = []
+    new_track_items_to_add = []
     already_synced_count = 0
+    skipped_not_found_count = 0
+    newly_not_found_count = 0
 
     for idx, t in enumerate(sp_tracks, start=1):
-        # 1. Comprobar primero por título y artista para evitar duplicados entre versiones de álbum/single
+        sp_id = t["spotify_id"]
         sig = normalize_signature(t["title"], t["artist"])
-        if sig in existing_signatures:
+
+        # 1. Si ya está sincronizada (en historial local o directamente en Apple Music) -> SALTAR
+        if history.is_synced(sp_id, sig) or sig in existing_signatures:
             already_synced_count += 1
+            if not history.is_synced(sp_id, sig):
+                history.mark_synced(sp_id, t["title"], t["artist"], "EXISTING", sig)
             continue
 
-        # 2. Si no existe por nombre, buscar usando el catálogo autenticado de Apple Music
+        # 2. Si ya fue buscada antes y sabemos que NO existe en Apple Music -> SALTAR INMEDIATO
+        if history.is_not_found(sp_id, sig):
+            skipped_not_found_count += 1
+            continue
+
+        # 3. Solo si es una canción verdaderamente nueva, buscarla en Apple Music
         track_id = apple.match_song(t["title"], t["artist"], t.get("album", ""), t.get("isrc", ""))
 
         if track_id:
@@ -633,40 +729,51 @@ def sync_playlist(spotify: SpotifyClient, apple: AppleMusicClient, spotify_id: s
             if clean_id in existing_catalog_ids:
                 already_synced_count += 1
                 existing_signatures.add(sig)
+                history.mark_synced(sp_id, t["title"], t["artist"], clean_id, sig)
             else:
-                new_track_ids_to_add.append(clean_id)
+                new_track_items_to_add.append((clean_id, sp_id, t["title"], t["artist"], sig))
                 existing_catalog_ids.add(clean_id)
                 existing_signatures.add(sig)
                 print(f"        + [Encontrada] Nueva: {t['title']} - {t['artist']} (ID: {clean_id})")
         else:
-            not_found_tracks.append(t)
-            print(f"        ? [No encontrada]: {t['title']} - {t['artist']}")
+            newly_not_found_count += 1
+            history.mark_not_found(sp_id, t["title"], t["artist"], sig)
+            print(f"        ? [No encontrada]: {t['title']} - {t['artist']} (guardada en {history.not_found_txt_file})")
 
         time.sleep(0.1)
 
     print(f"\n  Resumen previo:")
-    print(f"  - Ya estaban sincronizadas: {already_synced_count}")
-    print(f"  - Nuevas por agregar:       {len(new_track_ids_to_add)}")
-    print(f"  - No encontradas en Apple:  {len(not_found_tracks)}")
+    print(f"  - Ya estaban sincronizadas:             {already_synced_count}")
+    print(f"  - Omitidas (no existen en Apple Music): {skipped_not_found_count + newly_not_found_count}")
+    print(f"  - Nuevas por agregar ahora:             {len(new_track_items_to_add)}")
 
     # 4. Añadir las canciones nuevas a Apple Music
     added_count = 0
-    if new_track_ids_to_add:
-        print(f"\n  [4/4] Agregando {len(new_track_ids_to_add)} canciones a Apple Music...")
-        added_count = apple.add_tracks(apple_playlist_id, new_track_ids_to_add)
+    if new_track_items_to_add:
+        print(f"\n  [4/4] Agregando {len(new_track_items_to_add)} canciones a Apple Music...")
+        c_ids = [item[0] for item in new_track_items_to_add]
+        added_count = apple.add_tracks(apple_playlist_id, c_ids)
+        for clean_id, sp_id, title, artist, sig in new_track_items_to_add[:added_count]:
+            history.mark_synced(sp_id, title, artist, clean_id, sig)
         print(f"        ¡Éxito! Se añadieron {added_count} canciones.")
     else:
         print("\n  [4/4] Nada nuevo por agregar. La playlist está al día.")
+
+    # Guardar historial y reescribir los archivos .txt legibles para el usuario
+    history.save()
+    print(f"  [✓] Listas actualizadas en:")
+    print(f"      - Sincronizadas:   {history.synced_txt_file}")
+    print(f"      - No encontradas:  {history.not_found_txt_file}")
 
     return {
         "playlist": playlist_name,
         "total_spotify": len(sp_tracks),
         "already_synced": already_synced_count,
         "added": added_count,
-        "not_found": len(not_found_tracks)
+        "not_found": skipped_not_found_count + newly_not_found_count
     }
 
-def run_sync_job(config: dict, specific_spotify_id: str = None, specific_apple_name: str = None):
+def run_sync_job(config: dict, specific_spotify_id: str = None, specific_apple_name: str = None, reset_not_found: bool = False):
     """Ejecuta una ronda completa de sincronización para todas las playlists configuradas."""
     spotify = SpotifyClient(
         config["spotify_client_id"],
@@ -701,7 +808,7 @@ def run_sync_job(config: dict, specific_spotify_id: str = None, specific_apple_n
     for item in targets:
         sp_id = item["spotify_id"]
         ap_name = item.get("apple_name", "")
-        res = sync_playlist(spotify, apple, sp_id, ap_name)
+        res = sync_playlist(spotify, apple, sp_id, ap_name, reset_not_found=reset_not_found)
         report_lines.append(f"• **{res['playlist']}**: +{res['added']} añadidas ({res['already_synced']} ya existían, {res['not_found']} no encontradas).")
 
     summary = "\n".join(report_lines)
@@ -719,6 +826,7 @@ def main():
     parser.add_argument("--interval", type=int, default=None, help="Segundos de espera entre sincronizaciones en modo bucle (default: 3600).")
     parser.add_argument("--spotify-id", type=str, default=None, help="ID o URL de una playlist de Spotify específica.")
     parser.add_argument("--apple-name", type=str, default=None, help="Nombre de la playlist de destino en Apple Music.")
+    parser.add_argument("--reset-not-found", action="store_true", help="Vuelve a intentar buscar las canciones marcadas anteriormente como no encontradas.")
     args = parser.parse_args()
 
     config = load_config()
@@ -729,7 +837,7 @@ def main():
     # Si se especifican argumentos de playlist directamente
     if args.spotify_id:
         try:
-            run_sync_job(config, args.spotify_id, args.apple_name)
+            run_sync_job(config, args.spotify_id, args.apple_name, reset_not_found=args.reset_not_found)
         except AppleMusicAuthError as e:
             print(f"\n[ALERTA CRÍTICA] {e}")
             notify(config["discord_webhook"], "⚠️ Tokens de Apple Music expirados", str(e), is_error=True)
@@ -744,7 +852,7 @@ def main():
         print(f"[*] Iniciando Spotify-2-AppleMusic en modo Daemon (cada {config['sync_interval']} segundos)...")
         while True:
             try:
-                run_sync_job(config)
+                run_sync_job(config, reset_not_found=args.reset_not_found)
             except AppleMusicAuthError as e:
                 print(f"\n[ALERTA CRÍTICA] {e}")
                 notify(config["discord_webhook"], "⚠️ Tokens de Apple Music expirados en el servidor", str(e), is_error=True)
@@ -758,7 +866,7 @@ def main():
     else:
         # Modo único por defecto
         try:
-            run_sync_job(config)
+            run_sync_job(config, reset_not_found=args.reset_not_found)
         except AppleMusicAuthError as e:
             print(f"\n[ALERTA CRÍTICA] {e}")
             notify(config["discord_webhook"], "⚠️ Tokens de Apple Music expirados", str(e), is_error=True)

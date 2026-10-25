@@ -139,6 +139,15 @@ class SpotifyClient:
     def get_playlist_metadata(self, playlist_id: str) -> dict:
         token = self.get_token()
         clean_id = self.extract_playlist_id(playlist_id)
+        if clean_id.upper() in ("LIKES", "SAVED", "ME", "LIKED_SONGS"):
+            res = requests.get(
+                "https://api.spotify.com/v1/me/tracks?limit=1",
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=10
+            )
+            total = res.json().get("total", 0) if res.status_code == 200 else 0
+            return {"id": "LIKES", "name": "Canciones que te gustan (Likes)", "description": "Tus canciones favoritas de Spotify", "tracks": {"total": total}}
+
         res = requests.get(
             f"https://api.spotify.com/v1/playlists/{clean_id}",
             headers={"Authorization": f"Bearer {token}"},
@@ -150,9 +159,50 @@ class SpotifyClient:
         return res.json()
 
     def get_all_tracks(self, playlist_id: str) -> list:
-        """Obtiene todas las canciones de la playlist de Spotify con paginación y fallback automático."""
+        """Obtiene todas las canciones de la playlist (o Likes) de Spotify con paginación y fallback automático."""
         clean_id = self.extract_playlist_id(playlist_id)
         tracks = []
+
+        # Caso especial: Likes del usuario (endpoint /v1/me/tracks)
+        if clean_id.upper() in ("LIKES", "SAVED", "ME", "LIKED_SONGS"):
+            token = self.get_token()
+            limit = 50  # Máximo permitido por Spotify en /me/tracks
+            offset = 0
+            while True:
+                res = requests.get(
+                    "https://api.spotify.com/v1/me/tracks",
+                    headers={"Authorization": f"Bearer {token}"},
+                    params={"limit": limit, "offset": offset},
+                    timeout=15
+                )
+                if res.status_code != 200:
+                    raise Exception(f"Error al leer tus likes de Spotify: {res.status_code} - {res.text}")
+                data = res.json()
+                items = data.get("items", [])
+                for item in items:
+                    track = item.get("track")
+                    if not track or not track.get("id"):
+                        continue
+                    artists = track.get("artists", [])
+                    artist_names = [a.get("name", "") for a in artists if a.get("name")]
+                    primary_artist = artist_names[0] if artist_names else "Unknown Artist"
+                    album = track.get("album", {})
+                    album_artists = [a.get("name", "") for a in album.get("artists", [])]
+                    album_artist = album_artists[0] if album_artists else primary_artist
+                    tracks.append({
+                        "spotify_id": track.get("id"),
+                        "title": track.get("name", ""),
+                        "artist": primary_artist,
+                        "all_artists": ", ".join(artist_names),
+                        "album": album.get("name", ""),
+                        "album_artist": album_artist,
+                        "release_date": album.get("release_date", ""),
+                        "isrc": track.get("external_ids", {}).get("isrc", "")
+                    })
+                if len(items) < limit:
+                    break
+                offset += limit
+            return tracks
 
         # Intento 1: API oficial de Spotify (probando /items primero, luego /tracks)
         try:

@@ -103,7 +103,7 @@ def update_env_file(refresh_token: str):
         f.writelines(new_lines)
 
 def main():
-    scope = "playlist-read-private playlist-read-collaborative"
+    scope = "playlist-read-private playlist-read-collaborative user-library-read"
     auth_url = (
         f"https://accounts.spotify.com/authorize?"
         f"client_id={CLIENT_ID}&"

@@ -179,6 +179,8 @@ class SpotifyClient:
                     raise Exception(f"Error al leer tus likes de Spotify: {res.status_code} - {res.text}")
                 data = res.json()
                 items = data.get("items", [])
+                if not items:
+                    break
                 for item in items:
                     track = item.get("track")
                     if not track or not track.get("id"):
@@ -199,15 +201,15 @@ class SpotifyClient:
                         "release_date": album.get("release_date", ""),
                         "isrc": track.get("external_ids", {}).get("isrc", "")
                     })
-                if len(items) < limit:
+                offset += len(items)
+                if not data.get("next"):
                     break
-                offset += limit
             return tracks
 
         # Intento 1: API oficial de Spotify (probando /items primero, luego /tracks)
         try:
             token = self.get_token()
-            limit = 100
+            limit = 50
             offset = 0
 
             # Determinar endpoint soportado (/items en API nueva, /tracks en versiones anteriores)
@@ -231,6 +233,8 @@ class SpotifyClient:
                 if res.status_code == 200:
                     data = res.json()
                     items = data.get("items", [])
+                    if not items:
+                        break
                     for item in items:
                         track = item.get("item") or item.get("track")
                         if not track or not track.get("id"):
@@ -251,9 +255,9 @@ class SpotifyClient:
                             "release_date": album.get("release_date", ""),
                             "isrc": track.get("external_ids", {}).get("isrc", "")
                         })
-                    if len(items) < limit:
+                    offset += len(items)
+                    if not data.get("next"):
                         break
-                    offset += limit
                 elif res.status_code == 403:
                     print("        [Info] API oficial restringió lectura directa (403). Usando extractor público...")
                     tracks = []
@@ -392,15 +396,16 @@ class AppleMusicClient:
         else:
             raise Exception(f"No se pudo crear la playlist '{name}' en Apple Music: {res.status_code} - {res.text}")
 
-    def get_playlist_catalog_ids(self, playlist_id: str) -> set:
-        """Obtiene el conjunto de catalogIds de canciones ya presentes en la playlist."""
+    def get_playlist_existing_tracks(self, playlist_id: str) -> tuple[set, set]:
+        """Obtiene el conjunto de catalogIds y de firmas normalizadas (titulo:::artista) ya presentes en la playlist."""
         catalog_ids = set()
+        signatures = set()
         next_url = f"https://amp-api.music.apple.com/v1/me/library/playlists/{playlist_id}/tracks?limit=100"
 
         while next_url:
             res = self.session.get(next_url, timeout=15)
             if res.status_code == 404:
-                return set()
+                return set(), set()
             if res.status_code in (401, 403):
                 raise AppleMusicAuthError("Tokens de Apple Music expirados al leer canciones de la playlist.")
             if res.status_code != 200:
@@ -408,17 +413,22 @@ class AppleMusicClient:
 
             data = res.json()
             for track in data.get("data", []):
-                # playParams.catalogId contiene el ID público del catálogo
-                play_params = track.get("attributes", {}).get("playParams", {})
-                cid = play_params.get("catalogId")
+                attr = track.get("attributes", {})
+                play_params = attr.get("playParams", {})
+                cid = play_params.get("catalogId") or track.get("id")
                 if cid:
                     catalog_ids.add(str(cid))
+
+                name = attr.get("name", "")
+                artist = attr.get("artistName", "")
+                if name:
+                    signatures.add(normalize_signature(name, artist))
 
             next_url = data.get("next")
             if next_url and not next_url.startswith("http"):
                 next_url = f"https://amp-api.music.apple.com{next_url}"
 
-        return catalog_ids
+        return catalog_ids, signatures
 
     def match_by_isrc(self, isrc: str, album: str, album_artist: str) -> str | None:
         """Busca una canción en Apple Music usando el código ISRC."""
@@ -521,49 +531,50 @@ class AppleMusicClient:
             pass
         return str(catalog_id)
 
-    def add_tracks(self, playlist_id: str, track_ids: list, delay: float = 0.5) -> int:
-        """Agrega canciones a la playlist de Apple Music."""
+    def add_tracks(self, playlist_id: str, track_ids: list, delay: float = 0.25) -> int:
+        """Agrega canciones a la playlist de Apple Music de manera individual y garantizada."""
         if not track_ids:
             return 0
 
         added_count = 0
         url = f"https://amp-api.music.apple.com/v1/me/library/playlists/{playlist_id}/tracks"
 
-        # Se pueden agregar en pequeños lotes de hasta 25 para mayor velocidad y confiabilidad
-        batch_size = 25
-        for i in range(0, len(track_ids), batch_size):
-            batch = track_ids[i:i + batch_size]
-            payload = {
-                "data": [{"id": tid, "type": "songs"} for tid in batch]
-            }
-
+        for idx, tid in enumerate(track_ids, start=1):
+            payload = {"data": [{"id": str(tid), "type": "songs"}]}
             try:
-                res = self.session.post(url, json=payload, timeout=15)
+                res = self.session.post(url, json=payload, timeout=12)
                 if res.status_code in (200, 201, 204):
-                    added_count += len(batch)
+                    added_count += 1
                 elif res.status_code in (401, 403):
                     raise AppleMusicAuthError("Token de Apple Music caducó durante la adición de canciones.")
                 else:
-                    print(f"    [Advertencia] Error al añadir bloque ({res.status_code}): {res.text}. Intentando 1 por 1...")
-                    # Fallback individual
-                    for tid in batch:
-                        single_payload = {"data": [{"id": tid, "type": "songs"}]}
-                        r_single = self.session.post(url, json=single_payload, timeout=10)
-                        if r_single.status_code in (200, 201, 204):
-                            added_count += 1
-                        time.sleep(delay)
+                    print(f"    [Advertencia] No se pudo añadir pista {tid}: {res.status_code} - {res.text}")
             except AppleMusicAuthError:
                 raise
             except Exception as e:
-                print(f"    [Error] Fallo de conexión al añadir pistas: {e}")
+                print(f"    [Error] Fallo al añadir {tid}: {e}")
 
             time.sleep(delay)
 
         return added_count
 
-# ==============================================================================
-# MOTOR DE SINCRONIZACIÓN
-# ==============================================================================
+def normalize_signature(title: str, artist: str) -> str:
+    """Genera una firma normalizada y limpia (titulo:::artista) para deduplicación infalible."""
+    def clean(s: str) -> str:
+        s = s.lower().strip()
+        # Quitar paréntesis, corchetes y su contenido si contiene feat, remaster, live, etc.
+        s = re.sub(r'\s*[\(\[\{].*?(remaster|live|version|edit|feat|bonus|single|deluxe|explicit).*?[\)\]\}]', '', s, flags=re.I)
+        # Quitar sufijos comunes
+        s = re.sub(r'\s*-\s*(remaster|live|single|deluxe|radio edit|original mix).*', '', s, flags=re.I)
+        # Quitar puntuación y espacios extras
+        s = re.sub(r'[^\w\s]', '', s)
+        return ' '.join(s.split())
+
+    c_title = clean(title)
+    # Extraer artista principal
+    primary_artist = artist.split(",")[0].split(" feat")[0].split(" Feat")[0].split(" &")[0].strip()
+    c_artist = clean(primary_artist)
+    return f"{c_title}:::{c_artist}"
 
 def parse_playlists_config(raw_str: str) -> list:
     """Parsea una lista de cadenas con formato 'SPOTIFY_ID=APPLE_NAME;...'"""
@@ -598,8 +609,8 @@ def sync_playlist(spotify: SpotifyClient, apple: AppleMusicClient, spotify_id: s
     # 2. Obtener playlist y canciones ya presentes en Apple Music
     print("  [2/4] Verificando biblioteca de Apple Music...")
     apple_playlist_id = apple.get_or_create_playlist(playlist_name)
-    existing_catalog_ids = apple.get_playlist_catalog_ids(apple_playlist_id)
-    print(f"        Canciones actuales en Apple Music: {len(existing_catalog_ids)}")
+    existing_catalog_ids, existing_signatures = apple.get_playlist_existing_tracks(apple_playlist_id)
+    print(f"        Canciones actuales en Apple Music: {len(existing_signatures)} (IDs únicos: {len(existing_catalog_ids)})")
 
     # 3. Emparejar canciones de Spotify que no estén aún en Apple Music
     print("  [3/4] Identificando canciones nuevas...")
@@ -608,17 +619,24 @@ def sync_playlist(spotify: SpotifyClient, apple: AppleMusicClient, spotify_id: s
     already_synced_count = 0
 
     for idx, t in enumerate(sp_tracks, start=1):
-        # Buscar usando el catálogo autenticado de Apple Music
+        # 1. Comprobar primero por título y artista para evitar duplicados entre versiones de álbum/single
+        sig = normalize_signature(t["title"], t["artist"])
+        if sig in existing_signatures:
+            already_synced_count += 1
+            continue
+
+        # 2. Si no existe por nombre, buscar usando el catálogo autenticado de Apple Music
         track_id = apple.match_song(t["title"], t["artist"], t.get("album", ""), t.get("isrc", ""))
 
         if track_id:
-            # Obtener ID equivalente
             clean_id = apple.fetch_equivalent_id(track_id)
             if clean_id in existing_catalog_ids:
                 already_synced_count += 1
+                existing_signatures.add(sig)
             else:
                 new_track_ids_to_add.append(clean_id)
                 existing_catalog_ids.add(clean_id)
+                existing_signatures.add(sig)
                 print(f"        + [Encontrada] Nueva: {t['title']} - {t['artist']} (ID: {clean_id})")
         else:
             not_found_tracks.append(t)
